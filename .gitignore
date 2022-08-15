@@ -29,3 +29,7 @@ __pycache__
 /tests/.vscode
 /sonobuoy-output
 *.tmp
+.vscode/configurationCache.log
+.vscode/dryrun.log
+.vscode/settings.json
+.vscode/targets.log
