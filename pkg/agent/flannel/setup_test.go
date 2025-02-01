@@ -1,8 +1,8 @@
 package flannel
 
 import (
-	"io/ioutil"
 	"net"
+	"os"
 	"regexp"
 	"strings"
 	"testing"
@@ -62,13 +62,13 @@ func Test_createFlannelConf(t *testing.T) {
 		var agent = config.Agent{}
 		agent.ClusterCIDR = stringToCIDR(tt.args)[0]
 		agent.ClusterCIDRs = stringToCIDR(tt.args)
-		var nodeConfig = &config.Node{Docker: false, ContainerRuntimeEndpoint: "", NoFlannel: false, SELinux: false, FlannelBackend: "vxlan", FlannelConfFile: "test_file", FlannelConfOverride: false, FlannelIface: nil, Containerd: containerd, Images: "", AgentConfig: agent, Token: "", Certificate: nil, ServerHTTPSPort: 0}
+		var nodeConfig = &config.Node{Docker: false, ContainerRuntimeEndpoint: "", SELinux: false, FlannelBackend: "vxlan", FlannelConfFile: "test_file", FlannelConfOverride: false, FlannelIface: nil, Containerd: containerd, Images: "", AgentConfig: agent, Token: "", ServerHTTPSPort: 0}
 
 		t.Run(tt.name, func(t *testing.T) {
 			if err := createFlannelConf(nodeConfig); (err != nil) != tt.wantErr {
 				t.Errorf("createFlannelConf() error = %v, wantErr %v", err, tt.wantErr)
 			}
-			data, err := ioutil.ReadFile("test_file")
+			data, err := os.ReadFile("test_file")
 			if err != nil {
 				t.Errorf("Something went wrong when reading the flannel config file")
 			}

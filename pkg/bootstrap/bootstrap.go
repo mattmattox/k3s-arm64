@@ -3,7 +3,6 @@ package bootstrap
 import (
 	"encoding/json"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -34,13 +33,13 @@ func ReadFromDisk(w io.Writer, bootstrap *config.ControlRuntimeBootstrap) error 
 		if path == "" {
 			continue
 		}
-		data, err := ioutil.ReadFile(path)
+		info, err := os.Stat(path)
 		if err != nil {
-			logrus.Warnf("failed to read %s", path)
+			logrus.Warnf("failed to stat %s: %v", pathKey, err)
 			continue
 		}
 
-		info, err := os.Stat(path)
+		data, err := os.ReadFile(path)
 		if err != nil {
 			return err
 		}

@@ -34,10 +34,18 @@ Download the latest version (currently 2.2.19) of Vagrant [*from the website*](h
 
 ### Libvirt
 Follow the OS specific guides to install libvirt/qemu on your host:  
-    - [openSUSE](https://documentation.suse.com/sles/15-SP1/html/SLES-all/cha-vt-installation.html)
-    - [ubuntu](https://ubuntu.com/server/docs/virtualization-libvirt)
-    - [debian](https://wiki.debian.org/KVM#Installation)
-    - [fedora](https://developer.fedoraproject.org/tools/virtualization/installing-libvirt-and-virt-install-on-fedora-linux.html)
+- [openSUSE](https://documentation.suse.com/sles/15-SP1/html/SLES-all/cha-vt-installation.html)  
+- [ubuntu 20.04](https://ubuntu.com/server/docs/virtualization-libvirt)  
+- ubuntu 22.04: 
+  ```bash
+  sudo apt install ruby-libvirt qemu libvirt-daemon-system libvirt-clients ebtables dnsmasq-base libxslt-dev libxml2-dev libvirt-dev zlib1g-dev ruby-dev libguestfs-tools
+  ```
+- ubuntu 24.04:
+  ```bash
+  sudo apt install ruby-libvirt qemu-kvm libvirt-daemon-system libvirt-clients ebtables dnsmasq-base libxslt-dev libxml2-dev libvirt-dev zlib1g-dev ruby-dev libguestfs-tools
+  ```
+- [debian](https://wiki.debian.org/KVM#Installation)  
+- [fedora](https://developer.fedoraproject.org/tools/virtualization/installing-libvirt-and-virt-install-on-fedora-linux.html)
 
 ### Vagrant plugins
 Install the necessary vagrant plugins with the following command:
@@ -45,6 +53,14 @@ Install the necessary vagrant plugins with the following command:
 ```bash
 vagrant plugin install vagrant-libvirt vagrant-scp vagrant-k3s vagrant-reload
 ```
+### Kubectl
+
+For linux
+```bash
+   curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+   sudo install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
+```
+If it does not work, or you are on a different system, check the [official tutorial](https://kubernetes.io/docs/tasks/tools/install-kubectl-linux/)
 
 ## Running
 

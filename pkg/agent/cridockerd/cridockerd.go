@@ -1,15 +1,23 @@
+//go:build !no_cri_dockerd
+// +build !no_cri_dockerd
+
 package cridockerd
 
 import (
 	"context"
+	"errors"
 	"os"
 	"runtime/debug"
 	"strings"
 
 	"github.com/Mirantis/cri-dockerd/cmd"
+	"github.com/Mirantis/cri-dockerd/cmd/version"
+
+	"github.com/k3s-io/k3s/pkg/agent/cri"
 	"github.com/k3s-io/k3s/pkg/cgroups"
 	"github.com/k3s-io/k3s/pkg/daemons/config"
 	"github.com/sirupsen/logrus"
+
 	utilsnet "k8s.io/utils/net"
 )
 
@@ -22,23 +30,30 @@ func Run(ctx context.Context, cfg *config.Node) error {
 	command := cmd.NewDockerCRICommand(ctx.Done())
 	command.SetArgs(args)
 	logrus.Infof("Running cri-dockerd %s", config.ArgString(args))
+	logrus.Infof("cri-dockerd version %s", version.FullVersion())
 
 	go func() {
 		defer func() {
 			if err := recover(); err != nil {
-				logrus.Fatalf("cri-dockerd panic: %s", debug.Stack())
+				logrus.WithField("stack", string(debug.Stack())).Fatalf("cri-dockerd panic: %v", err)
 			}
 		}()
-		logrus.Fatalf("cri-dockerd exited: %v", command.ExecuteContext(ctx))
+		err := command.ExecuteContext(ctx)
+		if err != nil && !errors.Is(err, context.Canceled) {
+			logrus.Errorf("cri-dockerd exited: %v", err)
+			os.Exit(1)
+		}
+		os.Exit(0)
 	}()
 
-	return nil
+	return cri.WaitForService(ctx, cfg.CRIDockerd.Address, "cri-dockerd")
 }
 
 func getDockerCRIArgs(cfg *config.Node) []string {
 	argsMap := map[string]string{
 		"container-runtime-endpoint": cfg.CRIDockerd.Address,
 		"cri-dockerd-root-directory": cfg.CRIDockerd.Root,
+		"streaming-bind-addr":        "127.0.0.1:10010",
 	}
 
 	if dualNode, _ := utilsnet.IsDualStackIPs(cfg.AgentConfig.NodeIPs); dualNode {

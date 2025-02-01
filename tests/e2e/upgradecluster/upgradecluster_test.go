@@ -12,13 +12,19 @@ import (
 	. "github.com/onsi/gomega"
 )
 
-// Valid nodeOS: generic/ubuntu2004, opensuse/Leap-15.3.x86_64, dweomer/microos.amd64
-var nodeOS = flag.String("nodeOS", "generic/ubuntu2004", "VM operating system")
+// Valid nodeOS:
+// bento/ubuntu-24.04, eurolinux-vagrant/rocky-8, eurolinux-vagrant/rocky-9
+// opensuse/Leap-15.6.x86_64
+var nodeOS = flag.String("nodeOS", "bento/ubuntu-24.04", "VM operating system")
 var serverCount = flag.Int("serverCount", 3, "number of server nodes")
 var agentCount = flag.Int("agentCount", 2, "number of agent nodes")
 var hardened = flag.Bool("hardened", false, "true or false")
+var ci = flag.Bool("ci", false, "running on CI")
+var local = flag.Bool("local", false, "Controls which version k3s upgrades too, local binary or latest commit on master")
 
 // Environment Variables Info:
+// E2E_REGISTRY: true/false (default: false)
+// Controls which K3s version is installed first
 // E2E_RELEASE_VERSION=v1.23.3+k3s1
 // OR
 // E2E_RELEASE_CHANNEL=(commit|latest|stable), commit pulls latest commit from master
@@ -26,7 +32,8 @@ var hardened = flag.Bool("hardened", false, "true or false")
 func Test_E2EUpgradeValidation(t *testing.T) {
 	RegisterFailHandler(Fail)
 	flag.Parse()
-	RunSpecs(t, "Create Cluster Test Suite")
+	suiteConfig, reporterConfig := GinkgoConfiguration()
+	RunSpecs(t, "Upgrade Cluster Test Suite", suiteConfig, reporterConfig)
 }
 
 var (
@@ -35,12 +42,14 @@ var (
 	agentNodeNames  []string
 )
 
-var _ = Describe("Verify Upgrade", func() {
+var _ = ReportAfterEach(e2e.GenReport)
+
+var _ = Describe("Verify Upgrade", Ordered, func() {
 	Context("Cluster :", func() {
 		It("Starts up with no issues", func() {
 			var err error
 			serverNodeNames, agentNodeNames, err = e2e.CreateCluster(*nodeOS, *serverCount, *agentCount)
-			Expect(err).NotTo(HaveOccurred(), e2e.GetVagrantLog())
+			Expect(err).NotTo(HaveOccurred(), e2e.GetVagrantLog(err))
 			fmt.Println("CLUSTER CONFIG")
 			fmt.Println("OS:", *nodeOS)
 			fmt.Println("Server Nodes:", serverNodeNames)
@@ -57,7 +66,7 @@ var _ = Describe("Verify Upgrade", func() {
 				for _, node := range nodes {
 					g.Expect(node.Status).Should(Equal("Ready"))
 				}
-			}, "420s", "5s").Should(Succeed())
+			}, "620s", "5s").Should(Succeed())
 			_, _ = e2e.ParseNodes(kubeConfigFile, true)
 
 			fmt.Printf("\nFetching Pods status\n")
@@ -71,7 +80,7 @@ var _ = Describe("Verify Upgrade", func() {
 						g.Expect(pod.Status).Should(Equal("Running"), pod.Name)
 					}
 				}
-			}, "420s", "5s").Should(Succeed())
+			}, "620s", "5s").Should(Succeed())
 			_, _ = e2e.ParsePods(kubeConfigFile, true)
 		})
 
@@ -156,9 +165,9 @@ var _ = Describe("Verify Upgrade", func() {
 			Expect(err).NotTo(HaveOccurred(), "Daemonset manifest not deployed")
 
 			nodes, _ := e2e.ParseNodes(kubeConfigFile, false) //nodes :=
-			pods, _ := e2e.ParsePods(kubeConfigFile, false)
 
 			Eventually(func(g Gomega) {
+				pods, _ := e2e.ParsePods(kubeConfigFile, false)
 				count := e2e.CountOfStringInSlice("test-daemonset", pods)
 				fmt.Println("POD COUNT")
 				fmt.Println(count)
@@ -206,14 +215,13 @@ var _ = Describe("Verify Upgrade", func() {
 			}, "420s", "2s").Should(Succeed())
 
 			cmd := "kubectl --kubeconfig=" + kubeConfigFile + " exec volume-test -- sh -c 'echo local-path-test > /data/test'"
-			_, err = e2e.RunCommand(cmd)
-			Expect(err).NotTo(HaveOccurred())
+			res, err := e2e.RunCommand(cmd)
+			Expect(err).NotTo(HaveOccurred(), "failed cmd: %q result: %s", cmd, res)
 			fmt.Println("Data stored in pvc: local-path-test")
 
 			cmd = "kubectl delete pod volume-test --kubeconfig=" + kubeConfigFile
-			res, err := e2e.RunCommand(cmd)
-			Expect(err).NotTo(HaveOccurred())
-			fmt.Println(res)
+			res, err = e2e.RunCommand(cmd)
+			Expect(err).NotTo(HaveOccurred(), "failed cmd: %q result: %s", cmd, res)
 
 			_, err = e2e.DeployWorkload("local-path-provisioner.yaml", kubeConfigFile, *hardened)
 			Expect(err).NotTo(HaveOccurred(), "local-path-provisioner manifest not deployed")
@@ -236,14 +244,13 @@ var _ = Describe("Verify Upgrade", func() {
 			Eventually(func() (string, error) {
 				cmd := "kubectl exec volume-test --kubeconfig=" + kubeConfigFile + " -- cat /data/test"
 				return e2e.RunCommand(cmd)
-			}, "180s", "2s").Should(ContainSubstring("local-path-test"))
+			}, "180s", "2s").Should(ContainSubstring("local-path-test"), "Failed to retrieve data from pvc")
 		})
 
 		It("Upgrades with no issues", func() {
 			var err error
-			err = e2e.UpgradeCluster(serverNodeNames, agentNodeNames)
-			fmt.Println(err)
-			Expect(err).NotTo(HaveOccurred())
+			Expect(e2e.UpgradeCluster(append(serverNodeNames, agentNodeNames...), *local)).To(Succeed())
+			Expect(e2e.RestartCluster(append(serverNodeNames, agentNodeNames...))).To(Succeed())
 			fmt.Println("CLUSTER UPGRADED")
 			kubeConfigFile, err = e2e.GenKubeConfigFile(serverNodeNames[0])
 			Expect(err).NotTo(HaveOccurred())
@@ -344,9 +351,9 @@ var _ = Describe("Verify Upgrade", func() {
 
 		It("After upgrade verifies Daemonset", func() {
 			nodes, _ := e2e.ParseNodes(kubeConfigFile, false) //nodes :=
-			pods, _ := e2e.ParsePods(kubeConfigFile, false)
 
 			Eventually(func(g Gomega) {
+				pods, _ := e2e.ParsePods(kubeConfigFile, false)
 				count := e2e.CountOfStringInSlice("test-daemonset", pods)
 				fmt.Println("POD COUNT")
 				fmt.Println(count)
@@ -371,15 +378,18 @@ var _ = Describe("Verify Upgrade", func() {
 	})
 })
 
-var failed = false
+var failed bool
 var _ = AfterEach(func() {
-	failed = failed || CurrentGinkgoTestDescription().Failed
+	failed = failed || CurrentSpecReport().Failed()
 })
 
 var _ = AfterSuite(func() {
 	if failed {
-		fmt.Println("FAILED!")
+		AddReportEntry("journald-logs", e2e.TailJournalLogs(1000, append(serverNodeNames, agentNodeNames...)))
 	} else {
+		Expect(e2e.GetCoverageReport(append(serverNodeNames, agentNodeNames...))).To(Succeed())
+	}
+	if !failed || *ci {
 		Expect(e2e.DestroyCluster()).To(Succeed())
 		Expect(os.Remove(kubeConfigFile)).To(Succeed())
 	}

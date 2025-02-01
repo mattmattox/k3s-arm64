@@ -4,7 +4,6 @@
 package agent
 
 import (
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strings"
@@ -40,5 +39,9 @@ func setupCriCtlConfig(cfg cmds.Agent, nodeConfig *config.Node) error {
 	}
 
 	crp := "runtime-endpoint: " + cre + "\n"
-	return ioutil.WriteFile(filepath.Join(agentConfDir, "crictl.yaml"), []byte(crp), 0600)
+	ise := nodeConfig.ImageServiceEndpoint
+	if ise != "" && ise != cre {
+		crp += "image-endpoint: " + cre + "\n"
+	}
+	return os.WriteFile(filepath.Join(agentConfDir, "crictl.yaml"), []byte(crp), 0600)
 }

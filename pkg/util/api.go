@@ -10,17 +10,19 @@ import (
 	"time"
 
 	"github.com/pkg/errors"
-	"github.com/rancher/wrangler/pkg/merr"
-	"github.com/rancher/wrangler/pkg/schemes"
+	"github.com/rancher/wrangler/v3/pkg/merr"
+	"github.com/rancher/wrangler/v3/pkg/schemes"
 	"github.com/sirupsen/logrus"
+	authorizationv1 "k8s.io/api/authorization/v1"
 	v1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/dynamic"
 	clientset "k8s.io/client-go/kubernetes"
+	authorizationv1client "k8s.io/client-go/kubernetes/typed/authorization/v1"
 	coregetter "k8s.io/client-go/kubernetes/typed/core/v1"
 	"k8s.io/client-go/rest"
-	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/tools/record"
 )
 
@@ -55,7 +57,7 @@ func GetAddresses(endpoint *v1.Endpoints) []string {
 // readyz endpoint instead of the deprecated healthz endpoint, and supports context.
 func WaitForAPIServerReady(ctx context.Context, kubeconfigPath string, timeout time.Duration) error {
 	var lastErr error
-	restConfig, err := clientcmd.BuildConfigFromFlags("", kubeconfigPath)
+	restConfig, err := GetRESTConfig(kubeconfigPath)
 	if err != nil {
 		return err
 	}
@@ -77,7 +79,7 @@ func WaitForAPIServerReady(ctx context.Context, kubeconfigPath string, timeout t
 		return err
 	}
 
-	err = wait.PollImmediateWithContext(ctx, time.Second, timeout, func(ctx context.Context) (bool, error) {
+	err = wait.PollUntilContextTimeout(ctx, time.Second, timeout, true, func(ctx context.Context) (bool, error) {
 		healthStatus := 0
 		result := restClient.Get().AbsPath("/readyz").Do(ctx).StatusCode(&healthStatus)
 		if rerr := result.Error(); rerr != nil {
@@ -101,10 +103,116 @@ func WaitForAPIServerReady(ctx context.Context, kubeconfigPath string, timeout t
 	return nil
 }
 
+type genericAccessReviewRequest func(context.Context) (*authorizationv1.SubjectAccessReviewStatus, error)
+
+// WaitForRBACReady polls an AccessReview request until it returns an allowed response. If the user
+// and group are empty, it uses SelfSubjectAccessReview, otherwise SubjectAccessReview is used.  It
+// will return an error if the timeout expires, or nil if the SubjectAccessReviewStatus indicates
+// the access would be allowed.
+func WaitForRBACReady(ctx context.Context, kubeconfigPath string, timeout time.Duration, ra authorizationv1.ResourceAttributes, user string, groups ...string) error {
+	var lastErr error
+	restConfig, err := GetRESTConfig(kubeconfigPath)
+	if err != nil {
+		return err
+	}
+	authClient, err := authorizationv1client.NewForConfig(restConfig)
+	if err != nil {
+		return err
+	}
+
+	var reviewFunc genericAccessReviewRequest
+	if len(user) == 0 && len(groups) == 0 {
+		reviewFunc = selfSubjectAccessReview(authClient, ra)
+	} else {
+		reviewFunc = subjectAccessReview(authClient, ra, user, groups)
+	}
+
+	err = wait.PollUntilContextTimeout(ctx, time.Second, timeout, true, func(ctx context.Context) (bool, error) {
+		status, rerr := reviewFunc(ctx)
+		if rerr != nil {
+			lastErr = rerr
+			return false, nil
+		}
+		if status.Allowed {
+			return true, nil
+		}
+		lastErr = errors.New(status.Reason)
+		return false, nil
+	})
+
+	if err != nil {
+		return merr.NewErrors(err, lastErr)
+	}
+
+	return nil
+}
+
+// CheckRBAC performs a single SelfSubjectAccessReview or SubjectAccessReview, returning a
+// boolean indicating whether or not the requested access would be allowed. This is basically
+// `kubectl auth can-i`.
+func CheckRBAC(ctx context.Context, kubeconfigPath string, ra authorizationv1.ResourceAttributes, user string, groups ...string) (bool, error) {
+	restConfig, err := GetRESTConfig(kubeconfigPath)
+	if err != nil {
+		return false, err
+	}
+	authClient, err := authorizationv1client.NewForConfig(restConfig)
+	if err != nil {
+		return false, err
+	}
+
+	var reviewFunc genericAccessReviewRequest
+	if len(user) == 0 && len(groups) == 0 {
+		reviewFunc = selfSubjectAccessReview(authClient, ra)
+	} else {
+		reviewFunc = subjectAccessReview(authClient, ra, user, groups)
+	}
+
+	status, err := reviewFunc(ctx)
+	if err != nil {
+		return false, err
+	}
+
+	return status.Allowed, nil
+}
+
+// selfSubjectAccessReview returns a function that makes SelfSubjectAccessReview requests using the
+// provided client and attributes, returning a status or error.
+func selfSubjectAccessReview(authClient *authorizationv1client.AuthorizationV1Client, ra authorizationv1.ResourceAttributes) genericAccessReviewRequest {
+	return func(ctx context.Context) (*authorizationv1.SubjectAccessReviewStatus, error) {
+		r, err := authClient.SelfSubjectAccessReviews().Create(ctx, &authorizationv1.SelfSubjectAccessReview{
+			Spec: authorizationv1.SelfSubjectAccessReviewSpec{
+				ResourceAttributes: &ra,
+			},
+		}, metav1.CreateOptions{})
+		if err != nil {
+			return nil, err
+		}
+		return &r.Status, nil
+	}
+}
+
+// subjectAccessReview returns a function that makes SubjectAccessReview requests using the
+// provided client, attributes, user, and group, returning a status or error.
+func subjectAccessReview(authClient *authorizationv1client.AuthorizationV1Client, ra authorizationv1.ResourceAttributes, user string, groups []string) genericAccessReviewRequest {
+	return func(ctx context.Context) (*authorizationv1.SubjectAccessReviewStatus, error) {
+		r, err := authClient.SubjectAccessReviews().Create(ctx, &authorizationv1.SubjectAccessReview{
+			Spec: authorizationv1.SubjectAccessReviewSpec{
+				ResourceAttributes: &ra,
+				User:               user,
+				Groups:             groups,
+			},
+		}, metav1.CreateOptions{})
+		if err != nil {
+			return nil, err
+		}
+		return &r.Status, nil
+	}
+}
+
 func BuildControllerEventRecorder(k8s clientset.Interface, controllerName, namespace string) record.EventRecorder {
 	logrus.Infof("Creating %s event broadcaster", controllerName)
 	eventBroadcaster := record.NewBroadcaster()
-	eventBroadcaster.StartLogging(logrus.Infof)
+	eventBroadcaster.StartStructuredLogging(0)
 	eventBroadcaster.StartRecordingToSink(&coregetter.EventSinkImpl{Interface: k8s.CoreV1().Events(namespace)})
 	nodeName := os.Getenv("NODE_NAME")
 	return eventBroadcaster.NewRecorder(schemes.All, v1.EventSource{Component: controllerName, Host: nodeName})

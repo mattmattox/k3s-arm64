@@ -1,17 +1,17 @@
 package control
 
 import (
+	"bufio"
 	"context"
-	"fmt"
+	"io"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/k3s-io/k3s/pkg/daemons/config"
 	"github.com/k3s-io/k3s/pkg/daemons/control/proxy"
-	"github.com/k3s-io/k3s/pkg/generated/clientset/versioned/scheme"
 	"github.com/k3s-io/k3s/pkg/nodeconfig"
 	"github.com/k3s-io/k3s/pkg/util"
 	"github.com/k3s-io/k3s/pkg/version"
@@ -20,9 +20,6 @@ import (
 	"github.com/sirupsen/logrus"
 	"github.com/yl2chen/cidranger"
 	v1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/apiserver/pkg/endpoints/handlers/responsewriters"
 	"k8s.io/apiserver/pkg/endpoints/request"
 	"k8s.io/client-go/kubernetes"
 )
@@ -31,8 +28,7 @@ var defaultDialer = net.Dialer{}
 
 func loggingErrorWriter(rw http.ResponseWriter, req *http.Request, code int, err error) {
 	logrus.Debugf("Tunnel server error: %d %v", code, err)
-	rw.WriteHeader(code)
-	rw.Write([]byte(err.Error()))
+	util.SendError(err, rw, req, code)
 }
 
 func setupTunnel(ctx context.Context, cfg *config.Control) (http.Handler, error) {
@@ -42,7 +38,7 @@ func setupTunnel(ctx context.Context, cfg *config.Control) (http.Handler, error)
 		server: remotedialer.New(authorizer, loggingErrorWriter),
 		egress: map[string]bool{},
 	}
-	go tunnel.watch(ctx)
+	cfg.Runtime.ClusterControllerStarts["tunnel-server"] = tunnel.watch
 	return tunnel, nil
 }
 
@@ -75,13 +71,19 @@ type TunnelServer struct {
 var _ cidranger.RangerEntry = &tunnelEntry{}
 
 type tunnelEntry struct {
-	cidr     net.IPNet
-	nodeName string
-	node     bool
+	kubeletPort string
+	nodeName    string
+	cidr        net.IPNet
 }
 
 func (n *tunnelEntry) Network() net.IPNet {
 	return n.cidr
+}
+
+// Some ports can always be accessed via the tunnel server, at the loopback address.
+// Other addresses and ports are only accessible via the tunnel on newer agents, when used by a pod.
+func (n *tunnelEntry) IsReservedPort(port string) bool {
+	return n.kubeletPort != "" && (port == n.kubeletPort || port == config.StreamServerPort)
 }
 
 // ServeHTTP handles either CONNECT requests, or websocket requests to the remotedialer server
@@ -103,17 +105,10 @@ func (t *TunnelServer) watch(ctx context.Context) {
 		return
 	}
 
-	for {
-		if t.config.Runtime.Core != nil {
-			t.config.Runtime.Core.Core().V1().Node().OnChange(ctx, version.Program+"-tunnel-server", t.onChangeNode)
-			switch t.config.EgressSelectorMode {
-			case config.EgressSelectorModeCluster, config.EgressSelectorModePod:
-				t.config.Runtime.Core.Core().V1().Pod().OnChange(ctx, version.Program+"-tunnel-server", t.onChangePod)
-			}
-			return
-		}
-		logrus.Infof("Tunnel server egress proxy waiting for runtime core to become available")
-		time.Sleep(5 * time.Second)
+	t.config.Runtime.Core.Core().V1().Node().OnChange(ctx, version.Program+"-tunnel-server", t.onChangeNode)
+	switch t.config.EgressSelectorMode {
+	case config.EgressSelectorModeCluster, config.EgressSelectorModePod:
+		t.config.Runtime.Core.Core().V1().Pod().OnChange(ctx, version.Program+"-tunnel-server", t.onChangePod)
 	}
 }
 
@@ -132,7 +127,8 @@ func (t *TunnelServer) onChangeNode(nodeName string, node *v1.Node) (*v1.Node, e
 						t.cidrs.Remove(*n)
 					} else {
 						logrus.Debugf("Tunnel server egress proxy updating Node %s IP %v", nodeName, n)
-						t.cidrs.Insert(&tunnelEntry{cidr: *n, nodeName: nodeName, node: true})
+						kubeletPort := strconv.FormatInt(int64(node.Status.DaemonEndpoints.KubeletEndpoint.Port), 10)
+						t.cidrs.Insert(&tunnelEntry{cidr: *n, nodeName: nodeName, kubeletPort: kubeletPort})
 					}
 				}
 			}
@@ -163,7 +159,6 @@ func (t *TunnelServer) onChangePod(podName string, pod *v1.Pod) (*v1.Pod, error)
 		}
 	}
 	return pod, nil
-
 }
 
 // serveConnect attempts to handle the HTTP CONNECT request by dialing
@@ -171,33 +166,24 @@ func (t *TunnelServer) onChangePod(podName string, pod *v1.Pod) (*v1.Pod, error)
 func (t *TunnelServer) serveConnect(resp http.ResponseWriter, req *http.Request) {
 	bconn, err := t.dialBackend(req.Context(), req.Host)
 	if err != nil {
-		responsewriters.ErrorNegotiated(
-			apierrors.NewServiceUnavailable(err.Error()),
-			scheme.Codecs.WithoutConversion(), schema.GroupVersion{}, resp, req,
-		)
+		util.SendError(err, resp, req, http.StatusBadGateway)
 		return
 	}
 
 	hijacker, ok := resp.(http.Hijacker)
 	if !ok {
-		responsewriters.ErrorNegotiated(
-			apierrors.NewInternalError(errors.New("hijacking not supported")),
-			scheme.Codecs.WithoutConversion(), schema.GroupVersion{}, resp, req,
-		)
+		util.SendError(errors.New("hijacking not supported"), resp, req, http.StatusInternalServerError)
 		return
 	}
 	resp.WriteHeader(http.StatusOK)
 
-	rconn, _, err := hijacker.Hijack()
+	rconn, bufrw, err := hijacker.Hijack()
 	if err != nil {
-		responsewriters.ErrorNegotiated(
-			apierrors.NewInternalError(err),
-			scheme.Codecs.WithoutConversion(), schema.GroupVersion{}, resp, req,
-		)
+		util.SendError(err, resp, req, http.StatusInternalServerError)
 		return
 	}
 
-	proxy.Proxy(rconn, bconn)
+	proxy.Proxy(newConnReadWriteCloser(rconn, bufrw), bconn)
 }
 
 // dialBackend determines where to route the connection request to, and returns
@@ -210,7 +196,6 @@ func (t *TunnelServer) dialBackend(ctx context.Context, addr string) (net.Conn, 
 	if err != nil {
 		return nil, err
 	}
-	loopback := t.config.Loopback(true)
 
 	var nodeName string
 	var toKubelet, useTunnel bool
@@ -220,7 +205,7 @@ func (t *TunnelServer) dialBackend(ctx context.Context, addr string) (net.Conn, 
 		if nets, err := t.cidrs.ContainingNetworks(ip); err == nil && len(nets) > 0 {
 			if n, ok := nets[0].(*tunnelEntry); ok {
 				nodeName = n.nodeName
-				if n.node && config.KubeletReservedPorts[port] {
+				if n.IsReservedPort(port) {
 					toKubelet = true
 					useTunnel = true
 				} else {
@@ -237,14 +222,17 @@ func (t *TunnelServer) dialBackend(ctx context.Context, addr string) (net.Conn, 
 		useTunnel = true
 	}
 
-	// Always dial kubelet via the loopback address.
-	if toKubelet {
-		addr = fmt.Sprintf("%s:%s", loopback, port)
-	}
-
 	// If connecting to something hosted by the local node, don't tunnel
 	if nodeName == t.config.ServerNodeName {
 		useTunnel = false
+		if toKubelet {
+			// Dial local kubelet at the configured bind address
+			addr = net.JoinHostPort(t.config.BindAddress, port)
+		}
+	} else if toKubelet {
+		// Dial remote kubelet via the loopback address, the remotedialer client
+		// will ensure that it hits the right local address.
+		addr = net.JoinHostPort(t.config.Loopback(false), port)
 	}
 
 	if useTunnel {
@@ -269,4 +257,33 @@ func (t *TunnelServer) dialBackend(ctx context.Context, addr string) (net.Conn, 
 	// the destination is local; fall back to direct connection.
 	logrus.Debugf("Tunnel server egress proxy dialing %s directly", addr)
 	return defaultDialer.DialContext(ctx, "tcp", addr)
+}
+
+// connReadWriteCloser bundles a net.Conn and a wrapping bufio.ReadWriter together into a type that
+// meets the ReadWriteCloser interface. The http.Hijacker interface returns such a pair, and reads
+// need to go through the buffered reader (because the http handler may have already read from the
+// underlying connection), but writes and closes need to hit the connection directly.
+type connReadWriteCloser struct {
+	conn net.Conn
+	once sync.Once
+	rw   *bufio.ReadWriter
+}
+
+var _ io.ReadWriteCloser = &connReadWriteCloser{}
+
+func newConnReadWriteCloser(conn net.Conn, rw *bufio.ReadWriter) *connReadWriteCloser {
+	return &connReadWriteCloser{conn: conn, rw: rw}
+}
+
+func (crw *connReadWriteCloser) Read(p []byte) (n int, err error) {
+	return crw.rw.Read(p)
+}
+
+func (crw *connReadWriteCloser) Write(b []byte) (n int, err error) {
+	return crw.conn.Write(b)
+}
+
+func (crw *connReadWriteCloser) Close() (err error) {
+	crw.once.Do(func() { err = crw.conn.Close() })
+	return
 }

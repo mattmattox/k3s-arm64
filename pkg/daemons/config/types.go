@@ -2,20 +2,23 @@ package config
 
 import (
 	"context"
-	"crypto/tls"
 	"fmt"
 	"net"
 	"net/http"
 	"sort"
 	"strings"
 	"sync"
-	"time"
 
-	"github.com/k3s-io/k3s/pkg/util"
+	"github.com/k3s-io/k3s/pkg/generated/controllers/k3s.cattle.io"
 	"github.com/k3s-io/kine/pkg/endpoint"
-	"github.com/rancher/wrangler/pkg/generated/controllers/core"
+	"github.com/rancher/wharfie/pkg/registries"
+	"github.com/rancher/wrangler/v3/pkg/generated/controllers/core"
+	"github.com/rancher/wrangler/v3/pkg/leader"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	utilnet "k8s.io/apimachinery/pkg/util/net"
 	"k8s.io/apiserver/pkg/authentication/authenticator"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/tools/record"
 	utilsnet "k8s.io/utils/net"
 )
 
@@ -23,54 +26,73 @@ const (
 	FlannelBackendNone            = "none"
 	FlannelBackendVXLAN           = "vxlan"
 	FlannelBackendHostGW          = "host-gw"
-	FlannelBackendIPSEC           = "ipsec"
-	FlannelBackendWireguard       = "wireguard"
 	FlannelBackendWireguardNative = "wireguard-native"
+	FlannelBackendTailscale       = "tailscale"
 	EgressSelectorModeAgent       = "agent"
 	EgressSelectorModeCluster     = "cluster"
 	EgressSelectorModeDisabled    = "disabled"
 	EgressSelectorModePod         = "pod"
 	CertificateRenewDays          = 90
 	StreamServerPort              = "10010"
-	KubeletPort                   = "10250"
 )
-
-// These ports can always be accessed via the tunnel server, at the loopback address.
-// Other addresses and ports are only accessible via the tunnel on newer agents, when used by a pod.
-var KubeletReservedPorts = map[string]bool{
-	StreamServerPort: true,
-	KubeletPort:      true,
-}
 
 type Node struct {
 	Docker                   bool
 	ContainerRuntimeEndpoint string
+	ImageServiceEndpoint     string
 	NoFlannel                bool
 	SELinux                  bool
+	EnablePProf              bool
+	SupervisorMetrics        bool
+	EmbeddedRegistry         bool
 	FlannelBackend           string
 	FlannelConfFile          string
 	FlannelConfOverride      bool
 	FlannelIface             *net.Interface
 	FlannelIPv6Masq          bool
+	FlannelExternalIP        bool
 	EgressSelectorMode       string
 	Containerd               Containerd
 	CRIDockerd               CRIDockerd
 	Images                   string
 	AgentConfig              Agent
 	Token                    string
-	Certificate              *tls.Certificate
 	ServerHTTPSPort          int
+	SupervisorPort           int
+	DefaultRuntime           string
+}
+
+type EtcdS3 struct {
+	AccessKey     string          `json:"accessKey,omitempty"`
+	Bucket        string          `json:"bucket,omitempty"`
+	ConfigSecret  string          `json:"configSecret,omitempty"`
+	Endpoint      string          `json:"endpoint,omitempty"`
+	EndpointCA    string          `json:"endpointCA,omitempty"`
+	Folder        string          `json:"folder,omitempty"`
+	Proxy         string          `json:"proxy,omitempty"`
+	Region        string          `json:"region,omitempty"`
+	SecretKey     string          `json:"secretKey,omitempty"`
+	SessionToken  string          `json:"sessionToken,omitempty"`
+	Insecure      bool            `json:"insecure,omitempty"`
+	SkipSSLVerify bool            `json:"skipSSLVerify,omitempty"`
+	Timeout       metav1.Duration `json:"timeout,omitempty"`
 }
 
 type Containerd struct {
-	Address  string
-	Log      string
-	Root     string
-	State    string
-	Config   string
-	Opt      string
-	Template string
-	SELinux  bool
+	Address        string
+	Log            string
+	Root           string
+	State          string
+	Config         string
+	Opt            string
+	Template       string
+	BlockIOConfig  string
+	RDTConfig      string
+	Registry       string
+	NoDefault      bool
+	NonrootDevices bool
+	SELinux        bool
+	Debug          bool
 }
 
 type CRIDockerd struct {
@@ -82,6 +104,8 @@ type Agent struct {
 	PodManifests            string
 	NodeName                string
 	NodeConfigPath          string
+	ClientKubeletCert       string
+	ClientKubeletKey        string
 	ServingKubeletCert      string
 	ServingKubeletKey       string
 	ServiceCIDR             *net.IPNet
@@ -94,6 +118,7 @@ type Agent struct {
 	ClusterDomain           string
 	ResolvConf              string
 	RootDir                 string
+	KubeletConfigDir        string
 	KubeConfigKubelet       string
 	KubeConfigKubeProxy     string
 	KubeConfigK3sController string
@@ -101,6 +126,8 @@ type Agent struct {
 	NodeIPs                 []net.IP
 	NodeExternalIP          string
 	NodeExternalIPs         []net.IP
+	NodeInternalDNSs        []string
+	NodeExternalDNSs        []string
 	RuntimeSocket           string
 	ImageServiceSocket      string
 	ListenAddress           string
@@ -119,36 +146,45 @@ type Agent struct {
 	ImageCredProvConfig     string
 	IPSECPSK                string
 	FlannelCniConfFile      string
-	StrongSwanDir           string
-	PrivateRegistry         string
+	Registry                *registries.Registry
 	SystemDefaultRegistry   string
 	AirgapExtraRegistry     []string
 	DisableCCM              bool
 	DisableNPC              bool
+	MinTLSVersion           string
+	CipherSuites            []string
 	Rootless                bool
 	ProtectKernelDefaults   bool
 	DisableServiceLB        bool
 	EnableIPv4              bool
 	EnableIPv6              bool
+	VLevel                  int
+	VModule                 string
+	LogFile                 string
+	AlsoLogToStderr         bool
 }
 
 // CriticalControlArgs contains parameters that all control plane nodes in HA must share
+// The cli tag is used to provide better error information to the user on mismatch
 type CriticalControlArgs struct {
-	ClusterDNSs           []net.IP
-	ClusterIPRanges       []*net.IPNet
-	ClusterDNS            net.IP
-	ClusterDomain         string
-	ClusterIPRange        *net.IPNet
-	DisableCCM            bool
-	DisableHelmController bool
-	DisableNPC            bool
-	DisableServiceLB      bool
-	FlannelBackend        string
-	FlannelIPv6Masq       bool
-	EgressSelectorMode    string
-	NoCoreDNS             bool
-	ServiceIPRange        *net.IPNet
-	ServiceIPRanges       []*net.IPNet
+	ClusterDNSs           []net.IP     `cli:"cluster-dns"`
+	ClusterIPRanges       []*net.IPNet `cli:"cluster-cidr"`
+	ClusterDNS            net.IP       `cli:"cluster-dns"`
+	ClusterDomain         string       `cli:"cluster-domain"`
+	ClusterIPRange        *net.IPNet   `cli:"cluster-cidr"`
+	DisableCCM            bool         `cli:"disable-cloud-controller"`
+	DisableHelmController bool         `cli:"disable-helm-controller"`
+	DisableNPC            bool         `cli:"disable-network-policy"`
+	DisableServiceLB      bool         `cli:"disable-service-lb"`
+	EncryptSecrets        bool         `cli:"secrets-encryption"`
+	EmbeddedRegistry      bool         `cli:"embedded-registry"`
+	FlannelBackend        string       `cli:"flannel-backend"`
+	FlannelIPv6Masq       bool         `cli:"flannel-ipv6-masq"`
+	FlannelExternalIP     bool         `cli:"flannel-external-ip"`
+	EgressSelectorMode    string       `cli:"egress-selector-mode"`
+	ServiceIPRange        *net.IPNet   `cli:"service-cidr"`
+	ServiceIPRanges       []*net.IPNet `cli:"service-cidr"`
+	SupervisorMetrics     bool         `cli:"supervisor-metrics"`
 }
 
 type Control struct {
@@ -167,15 +203,21 @@ type Control struct {
 	ServiceNodePortRange     *utilnet.PortRange
 	KubeConfigOutput         string
 	KubeConfigMode           string
+	KubeConfigGroup          string
+	HelmJobImage             string
 	DataDir                  string
+	KineTLS                  bool
 	Datastore                endpoint.Config `json:"-"`
 	Disables                 map[string]bool
+	DisableAgent             bool
 	DisableAPIServer         bool
 	DisableControllerManager bool
 	DisableETCD              bool
 	DisableKubeProxy         bool
 	DisableScheduler         bool
-	EnablePProf              bool
+	DisableServiceLB         bool
+	Rootless                 bool
+	ServiceLBNamespace       string
 	ExtraAPIArgs             []string
 	ExtraControllerArgs      []string
 	ExtraCloudControllerArgs []string
@@ -190,34 +232,26 @@ type Control struct {
 	ClusterInit              bool
 	ClusterReset             bool
 	ClusterResetRestorePath  string
-	EncryptSecrets           bool
-	EncryptForce             bool
-	EncryptSkip              bool
-	TLSMinVersion            uint16
-	TLSCipherSuites          []uint16
-	EtcdSnapshotName         string        `json:"-"`
-	EtcdDisableSnapshots     bool          `json:"-"`
-	EtcdExposeMetrics        bool          `json:"-"`
-	EtcdSnapshotDir          string        `json:"-"`
-	EtcdSnapshotCron         string        `json:"-"`
-	EtcdSnapshotRetention    int           `json:"-"`
-	EtcdSnapshotCompress     bool          `json:"-"`
-	EtcdListFormat           string        `json:"-"`
-	EtcdS3                   bool          `json:"-"`
-	EtcdS3Endpoint           string        `json:"-"`
-	EtcdS3EndpointCA         string        `json:"-"`
-	EtcdS3SkipSSLVerify      bool          `json:"-"`
-	EtcdS3AccessKey          string        `json:"-"`
-	EtcdS3SecretKey          string        `json:"-"`
-	EtcdS3BucketName         string        `json:"-"`
-	EtcdS3Region             string        `json:"-"`
-	EtcdS3Folder             string        `json:"-"`
-	EtcdS3Timeout            time.Duration `json:"-"`
-	EtcdS3Insecure           bool          `json:"-"`
+	MinTLSVersion            string
+	CipherSuites             []string
+	TLSMinVersion            uint16   `json:"-"`
+	TLSCipherSuites          []uint16 `json:"-"`
+	EtcdSnapshotName         string   `json:"-"`
+	EtcdDisableSnapshots     bool     `json:"-"`
+	EtcdExposeMetrics        bool     `json:"-"`
+	EtcdSnapshotDir          string   `json:"-"`
+	EtcdSnapshotCron         string   `json:"-"`
+	EtcdSnapshotRetention    int      `json:"-"`
+	EtcdSnapshotCompress     bool     `json:"-"`
+	EtcdListFormat           string   `json:"-"`
+	EtcdS3                   *EtcdS3  `json:"-"`
 	ServerNodeName           string
+	VLevel                   int
+	VModule                  string
 
 	BindAddress string
 	SANs        []string
+	SANSecurity bool
 	PrivateIP   string
 	Runtime     *ControlRuntime `json:"-"`
 }
@@ -247,7 +281,7 @@ func (c *Control) BindAddressOrLoopback(chooseHostInterface, urlSafe bool) strin
 // service CIDRs indicate an IPv4/Dual-Stack or IPv6 only cluster. If the urlSafe
 // parameter is true, IPv6 addresses are enclosed in square brackets, as per RFC2732.
 func (c *Control) Loopback(urlSafe bool) string {
-	if IPv6OnlyService, _ := util.IsIPv6OnlyCIDRs(c.ServiceIPRanges); IPv6OnlyService {
+	if utilsnet.IsIPv6CIDR(c.ServiceIPRange) {
 		if urlSafe {
 			return "[::1]"
 		}
@@ -257,18 +291,18 @@ func (c *Control) Loopback(urlSafe bool) string {
 }
 
 type ControlRuntimeBootstrap struct {
-	ETCDServerCA       string
-	ETCDServerCAKey    string
-	ETCDPeerCA         string
-	ETCDPeerCAKey      string
-	ServerCA           string
-	ServerCAKey        string
-	ClientCA           string
-	ClientCAKey        string
-	ServiceKey         string
+	ETCDServerCA       string `rotate:"true"`
+	ETCDServerCAKey    string `rotate:"true"`
+	ETCDPeerCA         string `rotate:"true"`
+	ETCDPeerCAKey      string `rotate:"true"`
+	ServerCA           string `rotate:"true"`
+	ServerCAKey        string `rotate:"true"`
+	ClientCA           string `rotate:"true"`
+	ClientCAKey        string `rotate:"true"`
+	ServiceKey         string `rotate:"true"`
 	PasswdFile         string
-	RequestHeaderCA    string
-	RequestHeaderCAKey string
+	RequestHeaderCA    string `rotate:"true"`
+	RequestHeaderCAKey string `rotate:"true"`
 	IPSECKey           string
 	EncryptionConfig   string
 	EncryptionHash     string
@@ -277,19 +311,24 @@ type ControlRuntimeBootstrap struct {
 type ControlRuntime struct {
 	ControlRuntimeBootstrap
 
-	HTTPBootstrap                       bool
-	APIServerReady                      <-chan struct{}
-	AgentReady                          <-chan struct{}
-	ETCDReady                           <-chan struct{}
-	StartupHooksWg                      *sync.WaitGroup
-	ClusterControllerStart              func(ctx context.Context) error
-	LeaderElectedClusterControllerStart func(ctx context.Context) error
+	HTTPBootstrap                        bool
+	APIServerReady                       <-chan struct{}
+	ContainerRuntimeReady                <-chan struct{}
+	ETCDReady                            <-chan struct{}
+	StartupHooksWg                       *sync.WaitGroup
+	ClusterControllerStarts              map[string]leader.Callback
+	LeaderElectedClusterControllerStarts map[string]leader.Callback
 
 	ClientKubeAPICert string
 	ClientKubeAPIKey  string
 	NodePasswdFile    string
 
+	SigningClientCA   string
+	SigningServerCA   string
+	ServiceCurrentKey string
+
 	KubeConfigAdmin           string
+	KubeConfigSupervisor      string
 	KubeConfigController      string
 	KubeConfigScheduler       string
 	KubeConfigAPIServer       string
@@ -305,13 +344,16 @@ type ControlRuntime struct {
 	Tunnel             http.Handler
 	Authenticator      authenticator.Request
 
-	EgressSelectorConfig string
+	EgressSelectorConfig  string
+	CloudControllerConfig string
 
 	ClientAuthProxyCert string
 	ClientAuthProxyKey  string
 
 	ClientAdminCert           string
 	ClientAdminKey            string
+	ClientSupervisorCert      string
+	ClientSupervisorKey       string
 	ClientControllerCert      string
 	ClientControllerKey       string
 	ClientSchedulerCert       string
@@ -331,8 +373,25 @@ type ControlRuntime struct {
 	ClientETCDCert           string
 	ClientETCDKey            string
 
-	Core       *core.Factory
+	K8s        kubernetes.Interface
+	K3s        *k3s.Factory
+	Core       CoreFactory
+	Event      record.EventRecorder
 	EtcdConfig endpoint.ETCDConfig
+}
+
+type CoreFactory interface {
+	Core() core.Interface
+	Sync(ctx context.Context) error
+	Start(ctx context.Context, defaultThreadiness int) error
+}
+
+func NewRuntime(containerRuntimeReady <-chan struct{}) *ControlRuntime {
+	return &ControlRuntime{
+		ContainerRuntimeReady:                containerRuntimeReady,
+		ClusterControllerStarts:              map[string]leader.Callback{},
+		LeaderElectedClusterControllerStarts: map[string]leader.Callback{},
+	}
 }
 
 type ArgString []string
